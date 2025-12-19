@@ -11,10 +11,8 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from openai import AsyncOpenAI
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 
 # --- КОНФИГУРАЦИЯ ---
-load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
