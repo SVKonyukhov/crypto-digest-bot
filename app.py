@@ -1,11 +1,9 @@
 from flask import Flask
 import threading
-import asyncio
-import sys
+import subprocess
 import os
-
-# Импортируем функцию main из main.py
-from main import dp, bot
+import signal
+import time
 
 app = Flask(__name__)
 
@@ -13,17 +11,18 @@ app = Flask(__name__)
 def health():
     return 'OK', 200
 
-def run_bot():
-    """Запускает бота в отдельном потоке"""
+def start_bot():
+    """Запускает бота в отдельном процессе"""
+    time.sleep(2)  # Даем Flask время на запуск
     try:
-        asyncio.run(dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()))
+        subprocess.Popen([
+            'python', '-c',
+            'import asyncio; from main import main; asyncio.run(main())'
+        ])
     except Exception as e:
-        print(f"Bot error: {e}")
+        print(f"Bot start error: {e}")
 
 if __name__ == '__main__':
-    # Запускаем бота в отдельном потоке (daemon)
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
     bot_thread.start()
-    
-    # Запускаем Flask на порту 10000 с host='0.0.0.0'
-    app.run(host='0.0.0.0', port=10000, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=10000)
