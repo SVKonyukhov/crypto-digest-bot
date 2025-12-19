@@ -1,300 +1,306 @@
-import logging
 import asyncio
-from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import Message, BotCommand
-from aiogram.types.bot_command_scope import BotCommandScopeDefault
+import logging
 import feedparser
-import openai
-from dotenv import load_dotenv
-import os
 import json
-from aiohttp import ClientSession
-import time
+import os
+from datetime import datetime, timedelta
+from time import mktime
+from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from openai import AsyncOpenAI
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
-# Логирование
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+load_dotenv()
 
-# Загружаем переменные окружения (только для локальной разработки)
-if not os.getenv('RENDER'):
-    load_dotenv()
-
-# Инициализация
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL')
 
-openai.api_key = OPENAI_API_KEY
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
+if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
+    raise ValueError('TELEGRAM_TOKEN и OPENAI_API_KEY должны быть в .env файле!')
 
-# RSS каналы (твои 5 каналов)
+# RSS каналы
 RSS_FEEDS = [
-    "https://cryptonews.com/feed/",
-    "https://news.bitcoin.com/feed/",
-    "https://cointelegraph.com/feed/",
-    "https://decrypt.co/feed/",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/"
+    'https://www.coindesk.com/arc/outboundfeeds/rss/',
+    'https://bitcoinist.com/feed/',
+    'https://crypto.news/feed/',
+    'https://news.bitcoin.com/feed/',
+    'https://cryptobriefing.com/feed/'
 ]
 
-# Функция для получения новостей из RSS с обработкой ошибок
-async def get_news_from_feeds(hours: int = None, limit_per_feed: int = 10):
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+router = Router()
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+def clean_html(html_text):
+    """Очищает HTML от тегов"""
+    if not html_text:
+        return ''
+    soup = BeautifulSoup(html_text, 'html.parser')
+    return soup.get_text(separator=', ', strip=True)[:400]
+
+def get_recent_news(hours=None, limit_per_feed=10):
     """
-    Получает новости из RSS каналов
+    Получает новости из RSS каналов.
     
     Args:
-        hours: Количество часов для фильтра (None = без фильтра, все новости)
-        limit_per_feed: Максимальное кол-во новостей с одного канала
+        hours: Количество часов для фильтра (None = все новости без фильтра)
+        limit_per_feed: Макс кол-во новостей с одного канала
     
     Returns:
-        list: Список новостей с полями title, link, source, published
+        list: Отсортированный список новостей
     """
-    all_news = []
-    cutoff_time = None
+    news_items = []
+    time_threshold = datetime.now() - timedelta(hours=hours) if hours else None
     
-    if hours:
-        cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+    logger.info(f'📡 Загрузка RSS (фильтр: {hours if hours else "без фильтра"} часов)')
     
-    for feed_url in RSS_FEEDS:
+    for url in RSS_FEEDS:
         try:
-            logger.info(f"📡 Парсинг {feed_url}")
+            # Парсим RSS с таймаутом
+            feed = feedparser.parse(url)
             
-            # Парсим с таймаутом 10 секунд
-            feed = await asyncio.wait_for(
-                asyncio.to_thread(feedparser.parse, feed_url),
-                timeout=10.0
-            )
-            
-            # Проверяем наличие entries
+            # Проверяем валидность канала
             if not feed.entries:
-                logger.warning(f"⚠️ {feed_url}: Нет новостей (пустой канал)")
+                logger.warning(f'⚠️  {url}: Нет новостей (пустой канал)')
                 continue
             
-            # Обрабатываем каждую статью
+            logger.info(f'✓ {url}: найдено {len(feed.entries)} записей')
+            
             for entry in feed.entries[:limit_per_feed]:
                 try:
-                    # Извлекаем дату публикации
-                    published = None
+                    # Извлекаем дату
+                    pubtime = None
                     if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                        published = datetime(*entry.published_parsed[:6])
+                        pubtime = datetime.fromtimestamp(mktime(entry.published_parsed))
                     elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
-                        published = datetime(*entry.updated_parsed[:6])
+                        pubtime = datetime.fromtimestamp(mktime(entry.updated_parsed))
+                    else:
+                        pubtime = datetime.now()
                     
                     # Фильтруем по времени (если установлен фильтр)
-                    if cutoff_time and published:
-                        if published < cutoff_time:
-                            continue
+                    if time_threshold and pubtime < time_threshold:
+                        continue
                     
-                    # Создаём объект новости
-                    news_item = {
-                        'title': entry.get('title', 'Без заголовка'),
-                        'link': entry.get('link', ''),
-                        'source': feed.feed.get('title', 'Неизвестный источник'),
-                        'published': published.isoformat() if published else 'Неизвестно'
-                    }
-                    
-                    all_news.append(news_item)
-                    logger.info(f"✓ Добавлена новость: {news_item['title'][:50]}")
+                    # Добавляем новость
+                    news_items.append({
+                        'title': entry.title,
+                        'summary': clean_html(entry.get('summary', '')),
+                        'link': entry.link,
+                        'source': feed.feed.title if hasattr(feed.feed, 'title') else 'Unknown',
+                        'published': pubtime.isoformat()
+                    })
                     
                 except Exception as e:
-                    logger.error(f"❌ Ошибка при обработке статьи: {e}")
+                    logger.error(f'❌ Ошибка обработки статьи: {e}')
                     continue
         
-        except asyncio.TimeoutError:
-            logger.error(f"⏱️ {feed_url}: Таймаут (сервер не отвечает)")
         except Exception as e:
-            logger.error(f"❌ {feed_url}: Ошибка парсинга - {type(e).__name__}: {e}")
+            logger.error(f'❌ {url}: Ошибка парсинга - {type(e).__name__}: {str(e)[:100]}')
             continue
     
-    logger.info(f"📊 Всего собрано новостей: {len(all_news)}")
-    return all_news
+    logger.info(f'📊 Всего собрано новостей: {len(news_items)}')
+    return sorted(news_items, key=lambda x: x['published'], reverse=True)
 
-# Функция для генерации дайджеста через OpenAI
-async def generate_digest(news_list):
-    """
-    Генерирует дайджест через OpenAI
-    """
-    if not news_list:
+async def generate_digest(news_data, period_hours=None):
+    """Генерирует дайджест через OpenAI"""
+    
+    if not news_data:
         return None
     
     # Подготавливаем текст для OpenAI
-    news_text = "\n\n".join([
+    news_text = '\n\n'.join([
         f"Заголовок: {item['title']}\nИсточник: {item['source']}\nСсылка: {item['link']}"
-        for item in news_list[:20]  # Берём максимум 20 новостей
+        for item in news_data[:20]  # Максимум 20 новостей
     ])
     
-    prompt = f"""Ты - профессиональный аналитик криптовалютного рынка. 
+    period_text = f"за последние {period_hours} часов" if period_hours else "без временных ограничений"
     
-Твоя задача - создать краткий дайджест последних новостей криптовалютного рынка на основе предоставленных материалов.
+    prompt = f"""Ты - профессиональный аналитик криптовалютного рынка.
 
-ПРАВИЛА ФОРМАТИРОВАНИЯ:
-1. Ответ ИСКЛЮЧИТЕЛЬНО на русском языке
-2. Используй следующую структуру:
-   - 📰 **Основные новости:** (2-3 наиболее важных события)
-   - 📈 **Движение рынка:** (анализ цен и трендов)
-   - 🔔 **Важные обновления:** (регуляция, биржи, проекты)
-   - 💡 **Аналитика:** (краткий анализ)
+Создай краткий дайджест новостей криптовалют {period_text}.
 
-3. Каждый пункт - отдельный абзац, без нумерации
-4. Используй эмодзи для визуальной организации
-5. Максимум 500 символов
-6. Вставляй источники в формате [Источник](ссылка)
+ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:
+1. ИСКЛЮЧИТЕЛЬНО на русском языке
+2. Структура ответа:
+   📰 <b>Основные новости:</b> 2-3 ключевых события
+   📈 <b>Движение рынка:</b> анализ цен BTC, ETH, рыночные тренды
+   🔔 <b>Важные обновления:</b> регуляция, биржи, проекты, токены
+   💡 <b>Аналитика:</b> краткий прогноз
+
+3. Форматирование:
+   - Каждый раздел - отдельный абзац (используй <b></b> для заголовков)
+   - Максимум 500 символов
+   - Используй <a href="URL">текст</a> для ссылок
+   - Эмодзи в начале каждого раздела
 
 НОВОСТИ ДЛЯ АНАЛИЗА:
 {news_text}
 
-Создай дайджест, следуя всем правилам выше."""
+Создай дайджест прямо сейчас."""
 
     try:
-        response = await asyncio.to_thread(
-            lambda: openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=600
-            )
+        logger.info('🤖 Запрос к OpenAI...')
+        response = await client.chat.completions.create(
+            model='gpt-4o-mini',
+            messages=[{'role': 'user', 'content': prompt}],
+            temperature=0.5,
+            max_tokens=2000
         )
-        
-        return response.choices[0].message.content
+        result = response.choices[0].message.content
+        logger.info('✓ OpenAI ответил')
+        return result
     except Exception as e:
-        logger.error(f"❌ Ошибка OpenAI: {e}")
+        logger.error(f'❌ Ошибка OpenAI: {e}')
         return None
 
-# Регистрация команд
-async def set_commands():
-    commands = [
-        BotCommand(command="digest", description="📰 Полный дайджест (все последние новости)"),
-        BotCommand(command="digest6", description="⏱️ Новости за последние 6 часов"),
-        BotCommand(command="digest12", description="⏱️ Новости за последние 12 часов"),
-        BotCommand(command="start", description="Начать работу с ботом"),
-        BotCommand(command="help", description="Справка по командам"),
-    ]
-    await bot.set_my_commands(commands, BotCommandScopeDefault())
-
-# Обработчик /start
-@dp.message(Command("start"))
-async def handle_start(message: Message):
-    await message.reply(
-        "👋 Добро пожаловать в Crypto News Bot!\n\n"
-        "Доступные команды:\n"
-        "/digest — получить полный дайджест (все последние новости)\n"
-        "/digest6 — новости за последние 6 часов\n"
-        "/digest12 — новости за последние 12 часов\n\n"
-        "Выбери команду для получения дайджеста новостей криптовалют 📰"
+@router.message(Command('start'))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        '<b>👋 Добро пожаловать в Crypto News Bot!</b>\n\n'
+        '<b>Доступные команды:</b>\n'
+        '/digest - <i>полный дайджест (все последние новости)</i>\n'
+        '/digest12 - <i>новости за последние 12 часов</i>\n'
+        '/digest6 - <i>новости за последние 6 часов</i>\n\n'
+        '💡 Бот собирает новости из топ-5 криптовалютных источников и анализирует их через OpenAI'
     )
 
-# Обработчик /digest (без временного фильтра)
-@dp.message(Command("digest"))
-async def handle_digest_all(message: Message):
-    status_msg = await message.reply("⏳ Собираю новости со всех источников...")
+@router.message(Command('digest'))
+async def cmd_digest(message: types.Message):
+    """Полный дайджест БЕЗ фильтра времени - просто все последние новости"""
+    status_msg = await message.answer('⏳ Собираю последние новости со всех источников...')
     
     try:
-        # Получаем ВСЕ новости без фильтра по времени
-        news = await get_news_from_feeds(hours=None, limit_per_feed=15)
+        # Получаем ТОЛЬКО последние новости БЕЗ фильтра по времени
+        logger.info('Запрос: /digest (все новости)')
+        news = await asyncio.to_thread(get_recent_news, None, 15)  # hours=None, limit=15
         
         if not news:
-            await status_msg.edit_text("❌ Не удалось получить новости. Попробуй позже.")
+            await status_msg.edit_text(
+                '❌ <b>Не удалось получить новости</b>\n\n'
+                'Возможные причины:\n'
+                '• RSS каналы временно недоступны\n'
+                '• Проблема с интернет соединением\n\n'
+                'Попробуй позже (/digest6 или /digest12)'
+            )
             return
         
-        # Генерируем дайджест через OpenAI
-        digest = await generate_digest(news)
+        logger.info(f'Получено {len(news)} новостей')
+        await status_msg.edit_text(f'🔄 Анализирую {len(news)} новостей через AI...')
         
-        if digest:
-            await status_msg.edit_text(digest)
+        # Генерируем дайджест
+        digest_text = await generate_digest(news, period_hours=None)
+        
+        await status_msg.delete()
+        
+        if digest_text:
+            # Если текст больше 4096 символов, разбиваем на части
+            if len(digest_text) > 4096:
+                parts = [digest_text[i:i+4096] for i in range(0, len(digest_text), 4096)]
+                for part in parts:
+                    await message.answer(part, disable_web_page_preview=True)
+            else:
+                await message.answer(digest_text, disable_web_page_preview=True)
         else:
-            # Если OpenAI не сработал, показываем простой список
-            simple_digest = "📰 **Последние новости:**\n\n"
-            for item in news[:10]:
-                simple_digest += f"• {item['title']}\n  Источник: {item['source']}\n  🔗 {item['link']}\n\n"
-            await status_msg.edit_text(simple_digest[:4096])  # Лимит Telegram
-        
+            # Fallback: показываем простой список новостей
+            simple_digest = f'📰 <b>Последние новости ({len(news)} шт)</b>\n\n'
+            for idx, item in enumerate(news[:10], 1):
+                simple_digest += f'{idx}. <a href="{item["link"]}">{item["title"]}</a>\n'
+                simple_digest += f'   <i>{item["source"]}</i>\n'
+            
+            if len(simple_digest) > 4096:
+                parts = [simple_digest[i:i+4096] for i in range(0, len(simple_digest), 4096)]
+                for part in parts:
+                    await message.answer(part, disable_web_page_preview=True)
+            else:
+                await message.answer(simple_digest, disable_web_page_preview=True)
+    
     except Exception as e:
-        logger.error(f"Ошибка в /digest: {e}")
-        await status_msg.edit_text(f"❌ Ошибка: {e}")
+        logger.error(f'Ошибка в /digest: {e}')
+        await status_msg.edit_text(f'❌ Ошибка: {str(e)[:200]}')
 
-# Обработчик /digest6
-@dp.message(Command("digest6"))
-async def handle_digest_6h(message: Message):
-    status_msg = await message.reply("⏳ Собираю новости за последние 6 часов...")
+@router.message(Command('digest12'))
+async def cmd_digest_12h(message: types.Message):
+    """Дайджест за 12 часов"""
+    status_msg = await message.answer('⏳ Собираю новости за последние 12 часов...')
     
     try:
-        news = await get_news_from_feeds(hours=6, limit_per_feed=10)
+        logger.info('Запрос: /digest12 (12 часов)')
+        news = await asyncio.to_thread(get_recent_news, 12, 10)
         
         if not news:
-            await status_msg.edit_text("❌ Новостей за последние 6 часов не найдено.")
+            await status_msg.edit_text(
+                '❌ <b>Новостей за последние 12 часов не найдено</b>\n\n'
+                'Попробуй /digest (все новости) или /digest6'
+            )
             return
         
-        digest = await generate_digest(news)
+        logger.info(f'Получено {len(news)} новостей')
+        await status_msg.edit_text(f'🔄 Анализирую {len(news)} новостей...')
         
-        if digest:
-            await status_msg.edit_text(f"**Новости за 6 часов:**\n\n{digest}")
+        digest_text = await generate_digest(news, period_hours=12)
+        
+        await status_msg.delete()
+        
+        if digest_text:
+            if len(digest_text) > 4096:
+                parts = [digest_text[i:i+4096] for i in range(0, len(digest_text), 4096)]
+                for part in parts:
+                    await message.answer(part, disable_web_page_preview=True)
+            else:
+                await message.answer(digest_text, disable_web_page_preview=True)
         else:
-            simple_digest = f"📰 **Новости за 6 часов ({len(news)} шт):**\n\n"
-            for item in news[:10]:
-                simple_digest += f"• {item['title']}\n"
-            await status_msg.edit_text(simple_digest[:4096])
-        
+            simple_digest = f'📰 <b>Новости за 12 часов ({len(news)} шт)</b>\n\n'
+            for idx, item in enumerate(news[:10], 1):
+                simple_digest += f'{idx}. {item["title"][:100]}\n'
+            await message.answer(simple_digest[:4096], disable_web_page_preview=True)
+    
     except Exception as e:
-        logger.error(f"Ошибка в /digest6: {e}")
-        await status_msg.edit_text(f"❌ Ошибка: {e}")
+        logger.error(f'Ошибка в /digest12: {e}')
+        await status_msg.edit_text(f'❌ Ошибка: {str(e)[:200]}')
 
-# Обработчик /digest12
-@dp.message(Command("digest12"))
-async def handle_digest_12h(message: Message):
-    status_msg = await message.reply("⏳ Собираю новости за последние 12 часов...")
+@router.message(Command('digest6'))
+async def cmd_digest_6h(message: types.Message):
+    """Дайджест за 6 часов"""
+    status_msg = await message.answer('⏳ Собираю новости за последние 6 часов...')
     
     try:
-        news = await get_news_from_feeds(hours=12, limit_per_feed=10)
+        logger.info('Запрос: /digest6 (6 часов)')
+        news = await asyncio.to_thread(get_recent_news, 6, 10)
         
         if not news:
-            await status_msg.edit_text("❌ Новостей за последние 12 часов не найдено.")
+            await status_msg.edit_text(
+                '❌ <b>Новостей за последние 6 часов не найдено</b>\n\n'
+                'Попробуй /digest (все новости) или /digest12'
+            )
             return
         
-        digest = await generate_digest(news)
+        logger.info(f'Получено {len(news)} новостей')
+        await status_msg.edit_text(f'🔄 Анализирую {len(news)} новостей...')
         
-        if digest:
-            await status_msg.edit_text(f"**Новости за 12 часов:**\n\n{digest}")
+        digest_text = await generate_digest(news, period_hours=6)
+        
+        await status_msg.delete()
+        
+        if digest_text:
+            if len(digest_text) > 4096:
+                parts = [digest_text[i:i+4096] for i in range(0, len(digest_text), 4096)]
+                for part in parts:
+                    await message.answer(part, disable_web_page_preview=True)
+            else:
+                await message.answer(digest_text, disable_web_page_preview=True)
         else:
-            simple_digest = f"📰 **Новости за 12 часов ({len(news)} шт):**\n\n"
-            for item in news[:10]:
-                simple_digest += f"• {item['title']}\n"
-            await status_msg.edit_text(simple_digest[:4096])
-        
+            simple_digest = f'📰 <b>Новости за 6 часов ({len(news)} шт)</b>\n\n'
+            for idx, item in enumerate(news[:10], 1):
+                simple_digest += f'{idx}. {item["title"][:100]}\n'
+            await message.answer(simple_digest[:4096], disable_web_page_preview=True)
+    
     except Exception as e:
-        logger.error(f"Ошибка в /digest12: {e}")
-        await status_msg.edit_text(f"❌ Ошибка: {e}")
-
-# Обработчик /help
-@dp.message(Command("help"))
-async def handle_help(message: Message):
-    await message.reply(
-        "📚 **Справка:**\n\n"
-        "/digest — полный дайджест всех последних новостей (независимо от даты)\n"
-        "/digest6 — только новости за последние 6 часов\n"
-        "/digest12 — только новости за последние 12 часов\n\n"
-        "Каждый дайджест содержит анализ от AI с выделением ключевых событий 🚀"
-    )
-
-# Функция для запуска бота
-async def main():
-    logger.info("🚀 Запуск бота...")
-    
-    # Удаляем старый webhook
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✓ Webhook очищен")
-    except Exception as e:
-        logger.warning(f"Webhook не был установлен: {e}")
-    
-    # Регистрируем команды
-    await set_commands()
-    logger.info("✓ Команды зарегистрированы")
-    
-    # Запускаем polling
-    logger.info("📡 Запуск polling...")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_allowed_updates())
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        logger.error(f'Ошибка в /digest6: {e}')
+        await status
