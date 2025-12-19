@@ -3,9 +3,11 @@ import logging
 import feedparser
 import json
 import os
+import threading
 from datetime import datetime, timedelta
 from time import mktime
-from aiogram import Bot, Dispatcher, types, F, Router
+from flask import Flask
+from aiogram import Bot, Dispatcher, types, Router
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -30,20 +32,33 @@ RSS_FEEDS = [
     'https://cryptobriefing.com/feed/'
 ]
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
+# Flask для health check
+app = Flask(__name__)
+
+# Aiogram
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
+# Флаг для работы polling
+polling_active = False
+
 def clean_html(html_text):
     """Очищает HTML от тегов"""
     if not html_text:
         return ''
-    soup = BeautifulSoup(html_text, 'html.parser')
-    return soup.get_text(separator=', ', strip=True)[:400]
+    try:
+        soup = BeautifulSoup(html_text, 'html.parser')
+        return soup.get_text(separator=', ', strip=True)[:400]
+    except:
+        return html_text[:400]
 
 def get_recent_news(hours=None, limit_per_feed=10):
     """
@@ -63,7 +78,7 @@ def get_recent_news(hours=None, limit_per_feed=10):
     
     for url in RSS_FEEDS:
         try:
-            # Парсим RSS с таймаутом
+            # Парсим RSS
             feed = feedparser.parse(url)
             
             # Проверяем валидность канала
@@ -90,10 +105,10 @@ def get_recent_news(hours=None, limit_per_feed=10):
                     
                     # Добавляем новость
                     news_items.append({
-                        'title': entry.title,
+                        'title': entry.get('title', 'Без заголовка'),
                         'summary': clean_html(entry.get('summary', '')),
-                        'link': entry.link,
-                        'source': feed.feed.title if hasattr(feed.feed, 'title') else 'Unknown',
+                        'link': entry.get('link', ''),
+                        'source': feed.feed.get('title', 'Unknown') if hasattr(feed, 'feed') else 'Unknown',
                         'published': pubtime.isoformat()
                     })
                     
@@ -106,7 +121,7 @@ def get_recent_news(hours=None, limit_per_feed=10):
             continue
     
     logger.info(f'📊 Всего собрано новостей: {len(news_items)}')
-    return sorted(news_items, key=lambda x: x['published'], reverse=True)
+    return sorted(news_items, key=lambda x: x.get('published', ''), reverse=True)
 
 async def generate_digest(news_data, period_hours=None):
     """Генерирует дайджест через OpenAI"""
@@ -160,6 +175,8 @@ async def generate_digest(news_data, period_hours=None):
         logger.error(f'❌ Ошибка OpenAI: {e}')
         return None
 
+# ===== КОМАНДЫ БОТА =====
+
 @router.message(Command('start'))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -173,13 +190,12 @@ async def cmd_start(message: types.Message):
 
 @router.message(Command('digest'))
 async def cmd_digest(message: types.Message):
-    """Полный дайджест БЕЗ фильтра времени - просто все последние новости"""
+    """Полный дайджест БЕЗ фильтра времени"""
     status_msg = await message.answer('⏳ Собираю последние новости со всех источников...')
     
     try:
-        # Получаем ТОЛЬКО последние новости БЕЗ фильтра по времени
         logger.info('Запрос: /digest (все новости)')
-        news = await asyncio.to_thread(get_recent_news, None, 15)  # hours=None, limit=15
+        news = await asyncio.to_thread(get_recent_news, None, 15)
         
         if not news:
             await status_msg.edit_text(
@@ -211,7 +227,7 @@ async def cmd_digest(message: types.Message):
             # Fallback: показываем простой список новостей
             simple_digest = f'📰 <b>Последние новости ({len(news)} шт)</b>\n\n'
             for idx, item in enumerate(news[:10], 1):
-                simple_digest += f'{idx}. <a href="{item["link"]}">{item["title"]}</a>\n'
+                simple_digest += f'{idx}. <a href="{item["link"]}">{item["title"][:80]}</a>\n'
                 simple_digest += f'   <i>{item["source"]}</i>\n'
             
             if len(simple_digest) > 4096:
@@ -293,14 +309,3 @@ async def cmd_digest_6h(message: types.Message):
                 parts = [digest_text[i:i+4096] for i in range(0, len(digest_text), 4096)]
                 for part in parts:
                     await message.answer(part, disable_web_page_preview=True)
-            else:
-                await message.answer(digest_text, disable_web_page_preview=True)
-        else:
-            simple_digest = f'📰 <b>Новости за 6 часов ({len(news)} шт)</b>\n\n'
-            for idx, item in enumerate(news[:10], 1):
-                simple_digest += f'{idx}. {item["title"][:100]}\n'
-            await message.answer(simple_digest[:4096], disable_web_page_preview=True)
-    
-    except Exception as e:
-        logger.error(f'Ошибка в /digest6: {e}')
-        await status
