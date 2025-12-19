@@ -13,7 +13,6 @@ from openai import AsyncOpenAI
 from bs4 import BeautifulSoup
 
 # --- КОНФИГУРАЦИЯ ---
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -55,7 +54,8 @@ def get_recent_news(hours=24):
     
     for url in RSS_FEEDS:
         try:
-            feed = feedparser.parse(url)
+            # Добавляем timeout для каждой ленты (максимум 5 секунд)
+            feed = feedparser.parse(url, timeout=5)
             logger.info(f"Парсинг {url}: найдено {len(feed.entries)} записей")
             
             for entry in feed.entries[:5]:
@@ -140,7 +140,11 @@ async def cmd_digest(message: types.Message):
     status_msg = await message.answer("🔍 Сканирую RSS ленты...")
     
     try:
-        news = await asyncio.to_thread(get_recent_news, 24)
+        # TIMEOUT: максимум 30 секунд на парсинг RSS
+        news = await asyncio.wait_for(
+            asyncio.to_thread(get_recent_news, 24),
+            timeout=30.0
+        )
         
         if not news:
             await status_msg.edit_text("📭 Новостей за 24 часа не найдено.")
@@ -159,6 +163,9 @@ async def cmd_digest(message: types.Message):
         else:
             await message.answer(digest_text, disable_web_page_preview=True)
             
+    except asyncio.TimeoutError:
+        await status_msg.edit_text("⏱️ Timeout: RSS ленты загружались слишком долго. Попробуй позже.")
+        logger.error("Timeout при парсинге RSS")
     except Exception as e:
         await status_msg.edit_text(f"❌ Ошибка: {e}")
         logger.error(f"Ошибка в cmd_digest: {e}")
@@ -168,7 +175,11 @@ async def cmd_digest12(message: types.Message):
     status_msg = await message.answer("🔍 Сканирую RSS ленты за 12 часов...")
     
     try:
-        news = await asyncio.to_thread(get_recent_news, 12)
+        # TIMEOUT: максимум 30 секунд
+        news = await asyncio.wait_for(
+            asyncio.to_thread(get_recent_news, 12),
+            timeout=30.0
+        )
         
         if not news:
             await status_msg.edit_text("📭 Новостей за 12 часов не найдено.")
@@ -180,6 +191,8 @@ async def cmd_digest12(message: types.Message):
         await status_msg.delete()
         await message.answer(digest_text, disable_web_page_preview=True)
             
+    except asyncio.TimeoutError:
+        await status_msg.edit_text("⏱️ Timeout: RSS ленты загружались слишком долго. Попробуй позже.")
     except Exception as e:
         await status_msg.edit_text(f"❌ Ошибка: {e}")
 
@@ -188,7 +201,11 @@ async def cmd_digest6(message: types.Message):
     status_msg = await message.answer("🔍 Сканирую RSS ленты за 6 часов...")
     
     try:
-        news = await asyncio.to_thread(get_recent_news, 6)
+        # TIMEOUT: максимум 30 секунд
+        news = await asyncio.wait_for(
+            asyncio.to_thread(get_recent_news, 6),
+            timeout=30.0
+        )
         
         if not news:
             await status_msg.edit_text("📭 Новостей за 6 часов не найдено.")
@@ -200,6 +217,8 @@ async def cmd_digest6(message: types.Message):
         await status_msg.delete()
         await message.answer(digest_text, disable_web_page_preview=True)
             
+    except asyncio.TimeoutError:
+        await status_msg.edit_text("⏱️ Timeout: RSS ленты загружались слишком долго. Попробуй позже.")
     except Exception as e:
         await status_msg.edit_text(f"❌ Ошибка: {e}")
 
@@ -225,4 +244,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
