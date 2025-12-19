@@ -231,10 +231,18 @@ async def echo(message: types.Message):
     )
 
 async def main():
+    # Удаляем webhook перед запуском Polling
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook удален успешно")
+    except Exception as e:
+        logger.error(f"Ошибка при удалении webhook: {e}")
+    
     dp.include_router(router)
     logger.info("Бот запущен (Polling режим)")
+    logger.info(f"Запуск polling для бота {await bot.get_me()}")
+    
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     asyncio.run(main())
-
