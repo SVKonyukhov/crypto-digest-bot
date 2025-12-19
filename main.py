@@ -240,7 +240,8 @@ async def main():
     
     dp.include_router(router)
     logger.info("Бот запущен (Polling режим)")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    # НЕ вызываем start_polling здесь, это будет в app.py
+    return dp
 
 if __name__ == "__main__":
     asyncio.run(main())
