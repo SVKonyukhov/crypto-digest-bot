@@ -1,12 +1,9 @@
 import asyncio
 import logging
 import feedparser
-import json
 import os
-import threading
 from datetime import datetime, timedelta
 from time import mktime
-from flask import Flask
 from aiogram import Bot, Dispatcher, types, Router
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
@@ -23,7 +20,6 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
     raise ValueError('TELEGRAM_TOKEN и OPENAI_API_KEY должны быть в .env файле!')
 
-# RSS каналы
 RSS_FEEDS = [
     'https://www.coindesk.com/arc/outboundfeeds/rss/',
     'https://bitcoinist.com/feed/',
@@ -38,17 +34,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Flask для health check
-app = Flask(__name__)
-
-# Aiogram
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-# Флаг для работы polling
-polling_active = False
 
 def clean_html(html_text):
     """Очищает HTML от тегов"""
@@ -78,10 +67,8 @@ def get_recent_news(hours=None, limit_per_feed=10):
     
     for url in RSS_FEEDS:
         try:
-            # Парсим RSS
             feed = feedparser.parse(url)
             
-            # Проверяем валидность канала
             if not feed.entries:
                 logger.warning(f'⚠️  {url}: Нет новостей (пустой канал)')
                 continue
@@ -90,7 +77,6 @@ def get_recent_news(hours=None, limit_per_feed=10):
             
             for entry in feed.entries[:limit_per_feed]:
                 try:
-                    # Извлекаем дату
                     pubtime = None
                     if hasattr(entry, 'published_parsed') and entry.published_parsed:
                         pubtime = datetime.fromtimestamp(mktime(entry.published_parsed))
@@ -99,11 +85,9 @@ def get_recent_news(hours=None, limit_per_feed=10):
                     else:
                         pubtime = datetime.now()
                     
-                    # Фильтруем по времени (если установлен фильтр)
                     if time_threshold and pubtime < time_threshold:
                         continue
                     
-                    # Добавляем новость
                     news_items.append({
                         'title': entry.get('title', 'Без заголовка'),
                         'summary': clean_html(entry.get('summary', '')),
@@ -129,10 +113,9 @@ async def generate_digest(news_data, period_hours=None):
     if not news_data:
         return None
     
-    # Подготавливаем текст для OpenAI
     news_text = '\n\n'.join([
         f"Заголовок: {item['title']}\nИсточник: {item['source']}\nСсылка: {item['link']}"
-        for item in news_data[:20]  # Максимум 20 новостей
+        for item in news_data[:20]
     ])
     
     period_text = f"за последние {period_hours} часов" if period_hours else "без временных ограничений"
@@ -152,7 +135,7 @@ async def generate_digest(news_data, period_hours=None):
 3. Форматирование:
    - Каждый раздел - отдельный абзац (используй <b></b> для заголовков)
    - Максимум 500 символов
-   - Используй <a href="URL">текст</a> для ссылок
+   - Используй <a href="URL">текст</a> для ссылок на источники
    - Эмодзи в начале каждого раздела
 
 НОВОСТИ ДЛЯ АНАЛИЗА:
@@ -174,8 +157,6 @@ async def generate_digest(news_data, period_hours=None):
     except Exception as e:
         logger.error(f'❌ Ошибка OpenAI: {e}')
         return None
-
-# ===== КОМАНДЫ БОТА =====
 
 @router.message(Command('start'))
 async def cmd_start(message: types.Message):
@@ -210,13 +191,11 @@ async def cmd_digest(message: types.Message):
         logger.info(f'Получено {len(news)} новостей')
         await status_msg.edit_text(f'🔄 Анализирую {len(news)} новостей через AI...')
         
-        # Генерируем дайджест
         digest_text = await generate_digest(news, period_hours=None)
         
         await status_msg.delete()
         
         if digest_text:
-            # Если текст больше 4096 символов, разбиваем на части
             if len(digest_text) > 4096:
                 parts = [digest_text[i:i+4096] for i in range(0, len(digest_text), 4096)]
                 for part in parts:
@@ -224,7 +203,6 @@ async def cmd_digest(message: types.Message):
             else:
                 await message.answer(digest_text, disable_web_page_preview=True)
         else:
-            # Fallback: показываем простой список новостей
             simple_digest = f'📰 <b>Последние новости ({len(news)} шт)</b>\n\n'
             for idx, item in enumerate(news[:10], 1):
                 simple_digest += f'{idx}. <a href="{item["link"]}">{item["title"][:80]}</a>\n'
@@ -309,3 +287,37 @@ async def cmd_digest_6h(message: types.Message):
                 parts = [digest_text[i:i+4096] for i in range(0, len(digest_text), 4096)]
                 for part in parts:
                     await message.answer(part, disable_web_page_preview=True)
+            else:
+                await message.answer(digest_text, disable_web_page_preview=True)
+        else:
+            simple_digest = f'📰 <b>Новости за 6 часов ({len(news)} шт)</b>\n\n'
+            for idx, item in enumerate(news[:10], 1):
+                simple_digest += f'{idx}. {item["title"][:100]}\n'
+            await message.answer(simple_digest[:4096], disable_web_page_preview=True)
+    
+    except Exception as e:
+        logger.error(f'Ошибка в /digest6: {e}')
+        await status_msg.edit_text(f'❌ Ошибка: {str(e)[:200]}')
+
+async def main():
+    """Запуск бота"""
+    dp.include_router(router)
+    
+    logger.info('🚀 Запуск бота...')
+    
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info('✓ Webhook очищен')
+    except Exception as e:
+        logger.warning(f'Webhook не был установлен: {e}')
+    
+    logger.info('📡 Запуск polling...')
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info('❌ Бот остановлен пользователем')
+    except Exception as e:
+        logger.error(f'❌ Критическая ошибка: {e}')
